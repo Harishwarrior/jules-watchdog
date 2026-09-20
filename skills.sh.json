@@ -1,0 +1,6 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "name": "jules-watchdog",
+  "description": "Autonomous watchdog daemon and agent skill for Google Jules coding tasks and suggestions",
+  "homepage": "https://github.com/Harishwarrior/jules-watchdog"
+}

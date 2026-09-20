@@ -3,83 +3,93 @@ name: jules-watchdog
 description: Automated monitoring and watchdog daemon for Google Jules coding tasks and proactive suggestions. Use whenever the user wants to monitor Jules tasks, run a watchdog daemon, auto-approve Jules plans, auto-respond to Jules questions, or check Jules task completion status.
 ---
 
-# Jules Watchdog Skill
+# Jules Watchdog
 
-This skill provides an automated watchdog system and monitoring workflow for Google Jules sessions and proactive repository suggestions (`rewardive/rewardive-mobile`).
+Automated monitoring and watchdog daemon for Google Jules coding tasks and repository suggestions.
 
-## Capabilities
+## How It Works
 
-1. **Autonomous Plan Approval**: Detects when Jules pauses for plan approval (`AWAITING_PLAN_APPROVAL`, `isAwaitingReview: true`, or `PLANNING`), and automatically approves the plan to keep tasks progressing.
-2. **Interactive Feedback Dispatch**: Detects questions asked by Jules (`AWAITING_USER_FEEDBACK`) and automatically answers them to unblock the agent.
-3. **Continuous Lifecycle Monitoring**: Polls the Jules AIDA Swebot API, records state transitions in `watchdog_state.json`, and logs events to `watchdog.log`.
-4. **Subagent Delegation**: Provides guidelines for spawning dedicated monitor subagents to track tasks without consuming the main conversation context.
+1. **Polls Active Tasks**: Discovers tasks across connected repositories using the Jules AIDA Swebot API.
+2. **Autonomous Plan Approval**: Detects when Jules pauses for plan approval (`AWAITING_PLAN_APPROVAL`, `isAwaitingReview: true`, or `PLANNING`) and auto-approves the plan.
+3. **Interactive Feedback Dispatch**: Detects questions prompted by Jules (`AWAITING_USER_FEEDBACK`) and sends answers to unblock the agent.
+4. **Token Management**: Automatically detects expired OAuth tokens (HTTP 401) and refreshes credentials using `jules-cli`.
+5. **Lifecycle State Logging**: Tracks transitions to terminal states (`COMPLETED`, `FAILED`) and maintains detailed execution history.
 
----
+## Usage
 
-## Quick Reference & Commands
-
-The watchdog script is located at:
-[`.agents/skills/jules-watchdog/scripts/jules_watchdog.py`](file:///var/home/harish/Developer/rewardive-mobile/.agents/skills/jules-watchdog/scripts/jules_watchdog.py)
-
-### 1. Check Current Status (One-Shot)
 ```bash
-python3 .agents/skills/jules-watchdog/scripts/jules_watchdog.py --status
-```
-Outputs total tasks tracked, active tasks, completed count, and recent event history.
-
-### 2. Start Continuous Watchdog Daemon (Background)
-To launch the watchdog daemon in the background with a 20-second polling interval:
-```bash
-python3 .agents/skills/jules-watchdog/scripts/jules_watchdog.py --interval 20
+python3 scripts/jules_watchdog.py [options]
 ```
 
-### 3. Target a Specific Repository
+### Arguments
+
+- `--status` - Print current status report for all tasks and exit.
+- `--interval <seconds>` - Set polling interval for continuous background monitoring (default: `20`).
+- `--repo <sourceId>` - Target repository source ID (default: `github/rewardive/rewardive-mobile`).
+
+### Examples
+
+**1. One-shot status check:**
 ```bash
-python3 .agents/skills/jules-watchdog/scripts/jules_watchdog.py --repo github/rewardive/rewardive-mobile --interval 15
+python3 scripts/jules_watchdog.py --status
 ```
 
----
+**2. Continuous background monitoring daemon:**
+```bash
+python3 scripts/jules_watchdog.py --interval 20
+```
 
-## Technical Architecture & Jules API Reference
+**3. Target a specific GitHub repository:**
+```bash
+python3 scripts/jules_watchdog.py --repo github/owner/repo --interval 15
+```
 
-### Authentication
-- Jules CLI stores OAuth credentials in Linux Secret Service / Keyring under:
-  - **Service**: `jules-cli`
-  - **Username**: `default`
-- If an API call returns `401 Unauthorized`, the token is refreshed automatically by running:
-  ```bash
-  /home/linuxbrew/.linuxbrew/bin/jules remote list --session
-  ```
+## Output
 
-### Key API Endpoints (`https://aida.googleapis.com/v1/swebot`)
-- **List Tasks**: `GET https://aida.googleapis.com/v1/swebot/tasks?pageSize=100`
-- **Get Task Details**: `GET https://aida.googleapis.com/v1/swebot/tasks/{task_id}`
-- **List Tasks for Source**: `GET https://aida.googleapis.com/v1/swebot/sources/{encoded_source_id}/tasks`
-- **Approve Plan / Send Feedback**: `POST https://aida.googleapis.com/v1/swebot/tasks/{task_id}:interact`
-  ```json
-  {
-    "taskId": "{task_id}",
-    "userActivity": {
-      "planApproved": {}
-    }
-  }
-  ```
+```text
+=======================================================
+ Jules Watchdog Status Report: github/owner/repo
+=======================================================
+Total Tasks Tracked: 51
+Currently Active:    0
+Completed:           43
+Failed / Stale:      8
 
----
+No tasks currently awaiting approval or active.
+=======================================================
+```
 
-## Watchdog Workflow for Agents
+## Installation
 
-When requested to monitor or start Jules suggestions:
+### Via Vercel Skills CLI (`skills.sh`)
+```bash
+npx skills add Harishwarrior/jules-watchdog
+```
 
-1. **Verify Jules Authentication**:
-   Run `/home/linuxbrew/.linuxbrew/bin/jules remote list --session` to ensure fresh OAuth tokens.
+### Manual Installation
+**Antigravity / Gemini CLI:**
+```bash
+git clone https://github.com/Harishwarrior/jules-watchdog.git .agents/skills/jules-watchdog
+```
 
-2. **Check Current Status**:
-   Run `python3 .agents/skills/jules-watchdog/scripts/jules_watchdog.py --status` to inspect active and completed tasks.
+**Claude Code:**
+```bash
+git clone https://github.com/Harishwarrior/jules-watchdog.git ~/.claude/skills/jules-watchdog
+```
 
-3. **Launch the Watchdog**:
-   - Run the script in the background using `run_command` with `WaitMsBeforeAsync: 500`.
-   - Alternatively, spawn a dedicated subagent (`invoke_subagent`) to manage the watchdog process and report updates reactively.
+**Cursor:**
+```bash
+git clone https://github.com/Harishwarrior/jules-watchdog.git .cursor/skills/jules-watchdog
+```
 
-4. **Respond to Completion**:
-   When all tasks transition to `SWEBOT_TASK_STATUS_COMPLETED` or terminal state, report summary statistics and git commit details back to the user.
+## Present Results to User
+
+When tasks reach terminal completion, present summary metrics to the user:
+- Task ID and session URL (`https://jules.google.com/session/<taskId>`)
+- Final outcome (`SWEBOT_TASK_STATUS_COMPLETED` or `SWEBOT_TASK_STATUS_FAILED`)
+- Generated Git branch and commit details if changes were made.
+
+## Troubleshooting
+
+- **`401 Unauthorized`**: Run `jules remote list --session` in terminal to refresh OAuth token credentials in system keyring.
+- **`jules binary not found`**: Ensure `jules` is installed via Homebrew (`/home/linuxbrew/.linuxbrew/bin/jules` or in system `$PATH`).
