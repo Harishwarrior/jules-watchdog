@@ -2,7 +2,8 @@
 """
 Jules Autonomous Watchdog Daemon
 Monitors Google Jules sessions, auto-approves plans, unblocks stuck agent queries,
-detects and resolves stalled IN_PROGRESS/stuck bash sessions, and ensures tasks complete.
+detects and resolves stalled IN_PROGRESS/stuck bash sessions, revives pseudo-completed sessions
+without PRs that have unapproved plans or pending questions, and ensures all tasks produce PRs.
 Loads API key dynamically from root .env or JULES_API_KEY environment variable.
 """
 
@@ -79,15 +80,25 @@ def api_post(endpoint, payload=None):
 
 # Track sessions prompted to avoid spamming
 prompted_sessions = {}
+approved_plans = set()
 
 
-def check_stalled_in_progress(session):
+def check_and_handle_session_activity(session):
     """
-    Detect if an IN_PROGRESS session is stalled (e.g. 'Waiting for the bash session to finish',
-    pending user question not surfaced as state transition, or dormant).
+    Examines a session's activity timeline.
+    Handles:
+    1. Unapproved generated plans (approves them and kicks execution).
+    2. Stalled IN_PROGRESS sessions (bash hanging, dormant agent).
+    3. Pseudo-completed sessions that have NO PR outputs but have pending plans or questions.
     """
     sid = session.get("id") or session.get("name", "").split("/")[-1]
     title = (session.get("title") or "Untitled").split("\n")[0][:60]
+    st = session.get("state")
+
+    # If already has a pull request output, it is truly complete
+    outputs = session.get("outputs", [])
+    if any(o.get("pullRequest") for o in outputs):
+        return False
 
     try:
         act_data = api_get(f"sessions/{sid}/activities")
@@ -95,31 +106,56 @@ def check_stalled_in_progress(session):
         if not activities:
             return False
 
+        # Check for unapproved plans
+        has_plan = False
+        has_approval = False
+        for a in activities:
+            if "planGenerated" in a:
+                has_plan = True
+            if "planApproved" in a:
+                has_approval = True
+
+        if has_plan and not has_approval and sid not in approved_plans:
+            log(f"⚡ [AUTO-APPROVE DETECTED PLAN] Session {sid} ({title})")
+            try:
+                api_post(f"sessions/{sid}:approvePlan")
+                approved_plans.add(sid)
+                kick_prompt = (
+                    "Plan approved. Please execute the plan now, verify with fvm flutter analyze "
+                    "and fvm flutter test, and create the pull request."
+                )
+                api_post(f"sessions/{sid}:sendMessage", {"prompt": kick_prompt})
+                log(f"✅ Approved plan and kicked session {sid}")
+                return True
+            except Exception as e:
+                log(f"❌ Failed approving plan for {sid}: {e}")
+
+        # Check latest activity
         last_act = activities[-1]
         orig = last_act.get("originator")
         agent_msg = last_act.get("agentMessaged", {}).get("agentMessage", "")
 
-        # Check 1: Agent sent an error or waiting-for-bash message
         is_bash_stuck = "Waiting for the bash session to finish" in agent_msg
-
-        # Check 2: Last message was from agent asking a question, but session remains IN_PROGRESS
         is_unanswered_question = orig == "agent" and (
-            agent_msg.strip().endswith("?") or "Do you agree" in agent_msg or "Please clarify" in agent_msg
+            agent_msg.strip().endswith("?") or "clarify" in agent_msg or "Do you agree" in agent_msg
         )
 
         now = time.time()
         last_prompt_time = prompted_sessions.get(sid, 0)
 
-        if (is_bash_stuck or is_unanswered_question) and (now - last_prompt_time > 120):
-            log(f"⚠️ [STALLED DETECTED] Session {sid} ({title}): bash_stuck={is_bash_stuck}, question={is_unanswered_question}")
+        # Trigger if hung on bash, question unanswered, or pseudo-completed without PR
+        needs_kick = is_bash_stuck or is_unanswered_question or (st == "COMPLETED" and not outputs)
+
+        if needs_kick and (now - last_prompt_time > 120):
+            log(f"⚠️ [REVIVING/UNBLOCKING] Session {sid} ({title}): state={st}, bash={is_bash_stuck}, question={is_unanswered_question}")
             prompt = (
-                "Please proceed with the proposed implementation and plan. "
+                "Please proceed with the proposed implementation. "
                 "Follow standard project conventions, verify using 'fvm flutter analyze' and 'fvm flutter test', "
                 "and create the pull request once verified."
             )
             api_post(f"sessions/{sid}:sendMessage", {"prompt": prompt})
             prompted_sessions[sid] = now
-            log(f"⚡ [KICK-STARTED STALLED SESSION] Sent unblocking instruction to {sid}")
+            log(f"⚡ [PROMPT SENT] Revived session {sid}")
             return True
 
     except Exception as e:
@@ -150,7 +186,8 @@ def process_cycle():
     pending_plans = []
     stuck_feedback = []
     in_progress = []
-    completed = []
+    completed_with_pr = []
+    incomplete_completed = []
 
     for s in all_sessions:
         sid = s.get("id") or s.get("name").split("/")[-1]
@@ -159,6 +196,9 @@ def process_cycle():
         if "rewardive-mobile" not in src and src:
             continue
 
+        outputs = s.get("outputs", [])
+        has_pr = any(o.get("pullRequest") for o in outputs)
+
         if st == "AWAITING_PLAN_APPROVAL":
             pending_plans.append(s)
         elif st == "AWAITING_USER_FEEDBACK":
@@ -166,9 +206,12 @@ def process_cycle():
         elif st == "IN_PROGRESS":
             in_progress.append(s)
         elif st == "COMPLETED":
-            completed.append(s)
+            if has_pr:
+                completed_with_pr.append(s)
+            else:
+                incomplete_completed.append(s)
 
-    # 1. Auto-approve all plans
+    # 1. Auto-approve all explicit plans
     for s in pending_plans:
         sid = s.get("id") or s.get("name").split("/")[-1]
         title = (s.get("title") or "Untitled").split("\n")[0][:60]
@@ -178,7 +221,7 @@ def process_cycle():
         except Exception as e:
             log(f"❌ [APPROVE FAILED] Session {sid}: {e}")
 
-    # 2. Unblock all sessions awaiting feedback
+    # 2. Unblock all sessions explicitly awaiting feedback
     for s in stuck_feedback:
         sid = s.get("id") or s.get("name").split("/")[-1]
         title = (s.get("title") or "Untitled").split("\n")[0][:60]
@@ -193,15 +236,19 @@ def process_cycle():
         except Exception as e:
             log(f"❌ [PROMPT FAILED] Session {sid}: {e}")
 
-    # 3. Check and unblock stalled IN_PROGRESS sessions (e.g. bash hang, dormant agent)
+    # 3. Handle stalled IN_PROGRESS sessions
     for s in in_progress:
-        check_stalled_in_progress(s)
+        check_and_handle_session_activity(s)
+
+    # 4. Handle pseudo-completed sessions without PRs
+    for s in incomplete_completed:
+        check_and_handle_session_activity(s)
 
     log(
-        f"📊 Status: Active={len(in_progress)} | Approvals={len(pending_plans)} | Feedback={len(stuck_feedback)} | Completed={len(completed)}"
+        f"📊 Status: Active={len(in_progress)} | Approvals={len(pending_plans)} | Feedback={len(stuck_feedback)} | Completed(PR)={len(completed_with_pr)} | NeedsPR={len(incomplete_completed)}"
     )
 
-    return len(pending_plans) > 0 or len(stuck_feedback) > 0 or len(in_progress) > 0
+    return len(pending_plans) > 0 or len(stuck_feedback) > 0 or len(in_progress) > 0 or len(incomplete_completed) > 0
 
 
 def main(interval=20):
@@ -210,7 +257,7 @@ def main(interval=20):
         try:
             has_active = process_cycle()
             if not has_active:
-                log("🎉 All sessions reached terminal state (Completed/Failed)!")
+                log("🎉 All sessions reached terminal state and created PRs!")
                 break
         except Exception as e:
             log(f"⚠️ Error during cycle: {e}")
