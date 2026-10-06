@@ -101,6 +101,8 @@ def load_state():
         "approved_plans": {},
         "completed_tasks": {},
         "failed_tasks": {},
+        "revived_sessions": [],
+        "archived_sessions": [],
         "events": [],
     }
 
@@ -416,7 +418,15 @@ def handle_session(session, state):
         outputs = session.get("outputs", [])
         has_pr = any(o.get("pullRequest") for o in outputs)
         if has_pr:
-            archive_session(sid)
+            archived = state.setdefault("archived_sessions", [])
+            if sid not in archived:
+                log(f"📦 [AUTO-ARCHIVE] Archiving completed session {sid} with PR...")
+                ok, err = archive_session(sid)
+                if ok:
+                    archived.append(sid)
+                    record_event(state, "SESSION_ARCHIVED", sid, f"Archived completed session with PR: {title}")
+                else:
+                    log(f"Failed archiving {sid}: {err}")
         else:
             revived_sessions = state.setdefault("revived_sessions", [])
             if sid not in revived_sessions:
