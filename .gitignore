@@ -4,3 +4,5 @@ __pycache__/
 *.log
 *watchdog_state.json
 .DS_Store
+.env
+.env.*
