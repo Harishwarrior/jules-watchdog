@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
 Jules Autonomous Watchdog Daemon
-Monitors Google Jules sessions, auto-approves plans, answers agent queries,
-and ensures tasks run through to completion.
-Supports Google Jules v1alpha API via JULES_API_KEY env var or --api-key.
+Monitors Google Jules sessions, auto-approves plans, unblocks stuck agent queries,
+detects and resolves stalled IN_PROGRESS/stuck bash sessions, and ensures tasks complete.
+Loads API key dynamically from root .env or JULES_API_KEY environment variable.
 """
 
-import argparse
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
+
+BASE_URL = "https://jules.googleapis.com/v1alpha"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jules_daemon.log")
+
 
 def load_env_api_key():
     """Load JULES_API_KEY from os.environ or root .env files."""
@@ -37,13 +40,7 @@ def load_env_api_key():
         if parent == cur:
             break
         cur = parent
-
     return None
-
-
-API_KEY = load_env_api_key() or ""
-BASE_URL = "https://jules.googleapis.com/v1alpha"
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jules_daemon.log")
 
 
 def log(msg):
@@ -58,55 +55,109 @@ def log(msg):
 
 
 def api_get(endpoint):
-    global API_KEY
-    if not API_KEY:
-        API_KEY = load_env_api_key() or ""
+    key = load_env_api_key()
     sep = "&" if "?" in endpoint else "?"
-    url = f"{BASE_URL}/{endpoint}"
-    headers = {}
-    if API_KEY:
-        url = f"{url}{sep}key={API_KEY}"
-        headers["X-Goog-Api-Key"] = API_KEY
-    req = urllib.request.Request(url, headers=headers)
+    url = f"{BASE_URL}/{endpoint}{sep}key={key}"
+    req = urllib.request.Request(url, headers={"X-Goog-Api-Key": key})
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode())
 
 
 def api_post(endpoint, payload=None):
-    global API_KEY
-    if not API_KEY:
-        API_KEY = load_env_api_key() or ""
-    sep = "&" if "?" in endpoint else "?"
-    url = f"{BASE_URL}/{endpoint}"
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        url = f"{url}{sep}key={API_KEY}"
-        headers["X-Goog-Api-Key"] = API_KEY
+    key = load_env_api_key()
+    url = f"{BASE_URL}/{endpoint}?key={key}"
     data = json.dumps(payload or {}).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=data,
-        headers=headers,
+        headers={"X-Goog-Api-Key": key, "Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode())
 
 
-def process_cycle():
-    data = api_get("sessions")
-    sessions = data.get("sessions", [])
+# Track sessions prompted to avoid spamming
+prompted_sessions = {}
 
-    counts = {}
+
+def check_stalled_in_progress(session):
+    """
+    Detect if an IN_PROGRESS session is stalled (e.g. 'Waiting for the bash session to finish',
+    pending user question not surfaced as state transition, or dormant).
+    """
+    sid = session.get("id") or session.get("name", "").split("/")[-1]
+    title = (session.get("title") or "Untitled").split("\n")[0][:60]
+
+    try:
+        act_data = api_get(f"sessions/{sid}/activities")
+        activities = act_data.get("activities", [])
+        if not activities:
+            return False
+
+        last_act = activities[-1]
+        orig = last_act.get("originator")
+        agent_msg = last_act.get("agentMessaged", {}).get("agentMessage", "")
+
+        # Check 1: Agent sent an error or waiting-for-bash message
+        is_bash_stuck = "Waiting for the bash session to finish" in agent_msg
+
+        # Check 2: Last message was from agent asking a question, but session remains IN_PROGRESS
+        is_unanswered_question = orig == "agent" and (
+            agent_msg.strip().endswith("?") or "Do you agree" in agent_msg or "Please clarify" in agent_msg
+        )
+
+        now = time.time()
+        last_prompt_time = prompted_sessions.get(sid, 0)
+
+        if (is_bash_stuck or is_unanswered_question) and (now - last_prompt_time > 120):
+            log(f"⚠️ [STALLED DETECTED] Session {sid} ({title}): bash_stuck={is_bash_stuck}, question={is_unanswered_question}")
+            prompt = (
+                "Please proceed with the proposed implementation and plan. "
+                "Follow standard project conventions, verify using 'fvm flutter analyze' and 'fvm flutter test', "
+                "and create the pull request once verified."
+            )
+            api_post(f"sessions/{sid}:sendMessage", {"prompt": prompt})
+            prompted_sessions[sid] = now
+            log(f"⚡ [KICK-STARTED STALLED SESSION] Sent unblocking instruction to {sid}")
+            return True
+
+    except Exception as e:
+        log(f"Error checking activities for {sid}: {e}")
+
+    return False
+
+
+def process_cycle():
+    all_sessions = []
+    page_token = None
+
+    while True:
+        endpoint = "sessions?pageSize=100"
+        if page_token:
+            endpoint += f"&pageToken={page_token}"
+        try:
+            data = api_get(endpoint)
+            sessions = data.get("sessions", [])
+            all_sessions.extend(sessions)
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        except Exception as e:
+            log(f"Error fetching sessions page: {e}")
+            break
+
     pending_plans = []
     stuck_feedback = []
     in_progress = []
     completed = []
 
-    for s in sessions:
+    for s in all_sessions:
         sid = s.get("id") or s.get("name").split("/")[-1]
         st = s.get("state")
-        counts[st] = counts.get(st, 0) + 1
+        src = s.get("sourceContext", {}).get("source", "")
+        if "rewardive-mobile" not in src and src:
+            continue
 
         if st == "AWAITING_PLAN_APPROVAL":
             pending_plans.append(s)
@@ -142,11 +193,14 @@ def process_cycle():
         except Exception as e:
             log(f"❌ [PROMPT FAILED] Session {sid}: {e}")
 
+    # 3. Check and unblock stalled IN_PROGRESS sessions (e.g. bash hang, dormant agent)
+    for s in in_progress:
+        check_stalled_in_progress(s)
+
     log(
         f"📊 Status: Active={len(in_progress)} | Approvals={len(pending_plans)} | Feedback={len(stuck_feedback)} | Completed={len(completed)}"
     )
 
-    # Return True if any active tasks remain
     return len(pending_plans) > 0 or len(stuck_feedback) > 0 or len(in_progress) > 0
 
 
@@ -164,12 +218,4 @@ def main(interval=20):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Jules Autonomous Watchdog Daemon")
-    parser.add_argument("--api-key", default=None, help="Google Jules API key (or set JULES_API_KEY in .env)")
-    parser.add_argument("--interval", type=int, default=20, help="Cycle interval in seconds (default: 20)")
-    args = parser.parse_args()
-
-    if args.api_key:
-        API_KEY = args.api_key
-
-    main(interval=args.interval)
+    main()
