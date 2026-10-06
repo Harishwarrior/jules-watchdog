@@ -3,12 +3,15 @@
 Jules Watchdog Monitor & Automation Daemon
 
 Monitors Google Jules coding sessions / tasks for rewardive-mobile (or specified repository),
-automatically handling plan approvals, feedback requests, and state reporting.
+automatically handling plan approvals, feedback requests, pagination, and state reporting.
+Supports Google Jules v1alpha API (API Key via JULES_API_KEY or --api-key argument, and OAuth).
 """
 
 import argparse
+import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +23,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../.."))
 STATE_FILE = os.path.join(SCRIPT_DIR, "watchdog_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "watchdog.log")
+
+JULES_API_KEY = os.environ.get("JULES_API_KEY", "")
+JULES_BASE_URL = "https://jules.googleapis.com/v1alpha"
 
 
 def log(msg, to_file=True):
@@ -52,8 +58,8 @@ def load_state():
 
 def save_state(state):
     try:
-        if len(state.get("events", [])) > 300:
-            state["events"] = state["events"][-300:]
+        if len(state.get("events", [])) > 500:
+            state["events"] = state["events"][-500:]
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -71,11 +77,26 @@ def record_event(state, event_type, task_id, details=""):
     save_state(state)
 
 
+def find_jules_binary():
+    """Locate jules binary across common locations."""
+    for loc in [
+        shutil.which("jules"),
+        "/opt/homebrew/bin/jules",
+        "/usr/local/bin/jules",
+        "/home/linuxbrew/.linuxbrew/bin/jules",
+        os.path.expanduser("~/.local/bin/jules"),
+    ]:
+        if loc and os.path.isfile(loc) and os.access(loc, os.X_OK):
+            return loc
+    return "jules"
+
+
 def refresh_token_if_needed():
     """Trigger token refresh via jules CLI if OAuth expired."""
+    jules_bin = find_jules_binary()
     try:
         subprocess.run(
-            ["/home/linuxbrew/.linuxbrew/bin/jules", "remote", "list", "--session"],
+            [jules_bin, "remote", "list", "--session"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -85,18 +106,33 @@ def refresh_token_if_needed():
 
 
 def get_token():
-    """Retrieve OAuth token from system keyring or secretstorage."""
+    """Retrieve OAuth token from macOS keychain, system keyring, or secretstorage."""
+    # 1. macOS Keychain (standard for macOS installations)
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["security", "find-generic-password", "-s", "jules-cli", "-w"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if out.startswith("go-keyring-base64:"):
+                raw = base64.b64decode(out.split(":", 1)[1])
+                return json.loads(raw).get("access_token")
+            elif out:
+                return json.loads(out).get("access_token")
+        except Exception:
+            pass
+
+    # 2. Python keyring library
     try:
         import keyring
-
         token_data = json.loads(keyring.get_password("jules-cli", "default"))
         return token_data.get("access_token")
     except Exception:
         pass
 
+    # 3. Linux SecretStorage
     try:
         import secretstorage
-
         bus = secretstorage.dbus_init()
         collection = secretstorage.get_default_collection(bus)
         for item in collection.get_all_items():
@@ -109,206 +145,170 @@ def get_token():
     return None
 
 
-def api_call(url, method="GET", payload=None):
-    token = get_token()
-    if not token:
-        refresh_token_if_needed()
-        token = get_token()
-
+def jules_api_request(endpoint, method="GET", payload=None):
+    """Call Google Jules v1alpha API using API Key or OAuth Bearer token."""
+    global JULES_API_KEY
+    url = f"{JULES_BASE_URL}/{endpoint}"
     headers = {
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    data = json.dumps(payload).encode("utf-8") if payload else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    if JULES_API_KEY:
+        sep = "&" if "?" in endpoint else "?"
+        url = f"{url}{sep}key={JULES_API_KEY}"
+        headers["X-Goog-Api-Key"] = JULES_API_KEY
+    else:
+        token = get_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            raise ValueError(
+                "No Jules credentials found. Set JULES_API_KEY environment variable, "
+                "pass --api-key, or authenticate with 'jules login'."
+            )
+
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+
     try:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            log("Token expired (401). Refreshing token...")
+        if e.code == 401 and not JULES_API_KEY:
+            log("Received 401 Unauthorized with OAuth token, attempting refresh...")
             refresh_token_if_needed()
             token = get_token()
-            headers["Authorization"] = f"Bearer {token}"
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
-            with urllib.request.urlopen(req) as resp:
-                return resp.status, json.loads(resp.read().decode())
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read().decode())
         raise
 
 
-def is_task_active(t):
-    ts = t.get("taskStatus")
-    sts = t.get("swebotTaskStatus")
-    if ts in ["COMPLETED", "FAILED"] or sts in [
-        "SWEBOT_TASK_STATUS_COMPLETED",
-        "SWEBOT_TASK_STATUS_FAILED",
-    ]:
-        return False
-    return True
+def get_all_sessions_for_repo(repo_name=DEFAULT_REPO):
+    """Retrieve ALL sessions with full pagination."""
+    repo_normalized = repo_name.replace("github/", "").replace("sources/", "")
+    all_sessions = []
+    page_token = None
 
-
-def get_tasks_for_repo(repo_name=DEFAULT_REPO):
-    status, data = api_call("https://aida.googleapis.com/v1/swebot/tasks?pageSize=100")
-    tasks = data.get("tasks", [])
-    repo_tasks = [t for t in tasks if t.get("sourceId") == repo_name]
-    active = [t for t in repo_tasks if is_task_active(t)]
-    return active, repo_tasks
-
-
-def approve_plan(task_id):
-    url = f"https://aida.googleapis.com/v1/swebot/tasks/{task_id}:interact"
-    payload = {"taskId": task_id, "userActivity": {"planApproved": {}}}
-    try:
-        api_call(url, method="POST", payload=payload)
-        return True, None
-    except Exception as e:
+    while True:
+        endpoint = "sessions?pageSize=100"
+        if page_token:
+            endpoint += f"&pageToken={page_token}"
         try:
-            fb_payload = {
-                "taskId": task_id,
-                "userActivity": {
-                    "feedbackGiven": {
-                        "feedback": "Plan approved. Please proceed with implementation."
-                    }
-                },
-            }
-            api_call(url, method="POST", payload=fb_payload)
-            return True, None
-        except Exception as e2:
-            return False, f"{e}; fallback: {e2}"
+            _, data = jules_api_request(endpoint)
+            sessions = data.get("sessions", [])
+            all_sessions.extend(sessions)
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        except Exception as e:
+            log(f"Error fetching sessions page: {e}")
+            break
+
+    # Filter to matching repo source
+    repo_sessions = []
+    for s in all_sessions:
+        src = s.get("sourceContext", {}).get("source", "")
+        if not repo_normalized or repo_normalized in src or not src:
+            repo_sessions.append(s)
+
+    active = [s for s in repo_sessions if s.get("state") not in ["COMPLETED", "FAILED"]]
+    return active, repo_sessions
 
 
-def provide_feedback(
-    task_id,
-    answer="Please proceed with the proposed implementation following project conventions.",
-):
-    url = f"https://aida.googleapis.com/v1/swebot/tasks/{task_id}:interact"
-    payload = {
-        "taskId": task_id,
-        "userActivity": {"feedbackGiven": {"feedback": answer}},
-    }
+def approve_session_plan(session_id):
+    """Approve execution plan for a session."""
+    endpoint = f"sessions/{session_id}:approvePlan"
     try:
-        api_call(url, method="POST", payload=payload)
+        jules_api_request(endpoint, method="POST", payload={})
         return True, None
     except Exception as e:
         return False, str(e)
 
 
-def handle_task(task_id, state):
-    url = f"https://aida.googleapis.com/v1/swebot/tasks/{task_id}"
-    _, data = api_call(url)
-    task = data.get("task", {})
-    swebot_status = task.get("swebotTaskStatus")
-    task_status = task.get("taskStatus")
-    title = task.get("suggestedTitle") or task.get("title") or "Untitled Task"
-    latest_plan = task.get("latestPlan", {})
-    plan_id = latest_plan.get("id")
-    steps = latest_plan.get("steps", [])
-    is_awaiting_review = task.get("isAwaitingReview", False)
-    in_prog = task.get("inProgressWork", {})
-    step_title = in_prog.get("planStep", {}).get("title", "") if in_prog else ""
-    step_idx = in_prog.get("planStep", {}).get("index", "") if in_prog else ""
+def send_session_message(session_id, prompt):
+    """Send user instruction/answer to unblock session."""
+    endpoint = f"sessions/{session_id}:sendMessage"
+    payload = {"prompt": prompt}
+    try:
+        jules_api_request(endpoint, method="POST", payload=payload)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def handle_session(session, state):
+    sid = session.get("id") or session.get("name", "").split("/")[-1]
+    st = session.get("state")
+    title = (session.get("title") or "Untitled Task").split("\n")[0].strip()
 
     info = {
-        "id": task_id,
+        "id": sid,
         "title": title,
-        "taskStatus": task_status,
-        "swebotStatus": swebot_status,
-        "step_idx": step_idx,
-        "step_title": step_title,
-        "plan_id": plan_id,
+        "state": st,
     }
 
-    # Check for plan approval condition
-    needs_plan_approval = (
-        task_status == "AWAITING_PLAN_APPROVAL"
-        or swebot_status == "SWEBOT_TASK_STATUS_AWAITING_PLAN_APPROVAL"
-        or is_awaiting_review
-        or (
-            plan_id
-            and steps
-            and state.get("approved_plans", {}).get(task_id) != plan_id
-            and task_status not in ["COMPLETED", "FAILED"]
+    # 1. Auto-approve plan
+    if st == "AWAITING_PLAN_APPROVAL":
+        log(f"⚡ [AUTO-APPROVE] Approving plan for session {sid} ('{title}')...")
+        ok, err = approve_session_plan(sid)
+        if ok:
+            log(f"✅ Successfully approved plan for session {sid}")
+            record_event(state, "PLAN_APPROVED", sid, f"Plan approved for: {title}")
+        else:
+            log(f"❌ Failed to approve plan for session {sid}: {err}")
+            record_event(state, "PLAN_APPROVE_ERROR", sid, str(err))
+
+    # 2. Auto-unblock feedback
+    elif st == "AWAITING_USER_FEEDBACK":
+        log(f"💬 [AUTO-FEEDBACK] Sending prompt for session {sid} ('{title}')...")
+        answer = (
+            "Please proceed with the proposed implementation. "
+            "Follow standard project conventions, verify using 'fvm flutter analyze' and 'fvm flutter test', "
+            "and create the pull request once verified."
         )
-    )
-
-    if needs_plan_approval:
-        log(f"⚡ [AUTO-APPROVE] Approving plan for task {task_id} ('{title}')...")
-        ok, err = approve_plan(task_id)
+        ok, err = send_session_message(sid, answer)
         if ok:
-            log(f"✅ Successfully approved plan for task {task_id}")
-            state.setdefault("approved_plans", {})[task_id] = plan_id or "approved"
-            record_event(state, "PLAN_APPROVED", task_id, f"Plan approved for: {title}")
+            log(f"✅ Successfully sent unblocking prompt for session {sid}")
+            record_event(state, "FEEDBACK_GIVEN", sid, f"Feedback sent for: {title}")
         else:
-            log(f"❌ Failed to approve plan for task {task_id}: {err}")
-            record_event(state, "PLAN_APPROVE_ERROR", task_id, str(err))
-
-    # Check for feedback condition
-    needs_feedback = (
-        task_status == "AWAITING_USER_FEEDBACK"
-        or swebot_status == "SWEBOT_TASK_STATUS_AWAITING_USER_FEEDBACK"
-    )
-
-    if needs_feedback:
-        log(f"💬 [AUTO-FEEDBACK] Providing feedback for task {task_id} ('{title}')...")
-        act_steps = task.get("activitySteps", [])
-        last_question = ""
-        for s in reversed(act_steps):
-            q = s.get("agentActivity", {}).get("userQuestion", {}).get("question")
-            if q:
-                last_question = q
-                break
-        answer = "Please proceed with the proposed implementation following project conventions."
-        if last_question:
-            log(f"Responding to question: {last_question[:80]}...")
-        ok, err = provide_feedback(task_id, answer)
-        if ok:
-            log(f"✅ Successfully provided feedback for task {task_id}")
-            record_event(
-                state, "FEEDBACK_GIVEN", task_id, f"Feedback sent for: {title}"
-            )
-        else:
-            log(f"❌ Failed to provide feedback for task {task_id}: {err}")
-            record_event(state, "FEEDBACK_ERROR", task_id, str(err))
+            log(f"❌ Failed to send prompt for session {sid}: {err}")
+            record_event(state, "FEEDBACK_ERROR", sid, str(err))
 
     return info
 
 
-def check_status(repo_name=DEFAULT_REPO):
-    """One-shot status check and display."""
-    active_tasks, all_tasks = get_tasks_for_repo(repo_name)
+def check_status(repo_name=DEFAULT_REPO, api_key=None):
+    global JULES_API_KEY
+    if api_key:
+        JULES_API_KEY = api_key
+
+    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
     state = load_state()
 
     print(f"\n=======================================================")
     print(f" Jules Watchdog Status Report: {repo_name}")
     print(f"=======================================================")
-    print(f"Total Tasks Tracked: {len(all_tasks)}")
-    print(f"Currently Active:    {len(active_tasks)}")
+    print(f"Total Sessions Tracked: {len(all_sessions)}")
+    print(f"Currently Active:       {len(active_sessions)}")
 
-    completed = [
-        t
-        for t in all_tasks
-        if t.get("swebotTaskStatus") == "SWEBOT_TASK_STATUS_COMPLETED"
-        or t.get("taskStatus") == "COMPLETED"
-    ]
-    failed = [
-        t
-        for t in all_tasks
-        if t.get("swebotTaskStatus") == "SWEBOT_TASK_STATUS_FAILED"
-        or t.get("taskStatus") == "FAILED"
-    ]
+    completed = [s for s in all_sessions if s.get("state") == "COMPLETED"]
+    failed = [s for s in all_sessions if s.get("state") == "FAILED"]
 
-    print(f"Completed:           {len(completed)}")
-    print(f"Failed / Stale:      {len(failed)}")
+    print(f"Completed:              {len(completed)}")
+    print(f"Failed / Stale:         {len(failed)}")
 
-    if active_tasks:
-        print(f"\nActive Tasks ({len(active_tasks)}):")
-        for t in active_tasks:
-            tid = t.get("id")
-            title = t.get("suggestedTitle") or t.get("title") or "Untitled Task"
-            st = t.get("swebotTaskStatus") or t.get("taskStatus")
-            print(f"  • [{st}] {tid}: {title}")
+    if active_sessions:
+        print(f"\nActive Sessions ({len(active_sessions)}):")
+        for s in active_sessions:
+            sid = s.get("id") or s.get("name", "").split("/")[-1]
+            title = (s.get("title") or "Untitled Task").split("\n")[0].strip()
+            st = s.get("state")
+            print(f"  • [{st}] {sid}: {title}")
     else:
-        print("\nNo tasks currently awaiting approval or active.")
+        print("\nNo sessions currently active or awaiting approval.")
 
     recent_events = state.get("events", [])[-5:]
     if recent_events:
@@ -318,9 +318,13 @@ def check_status(repo_name=DEFAULT_REPO):
     print(f"=======================================================\n")
 
 
-def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False):
+def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False, api_key=None):
+    global JULES_API_KEY
+    if api_key:
+        JULES_API_KEY = api_key
+
     if oneshot:
-        check_status(repo_name)
+        check_status(repo_name, api_key=api_key)
         return
 
     log(f"Starting Jules Watchdog Daemon for {repo_name} (poll interval: {poll_interval}s)...")
@@ -328,64 +332,41 @@ def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False):
 
     while True:
         try:
-            active_tasks, all_tasks = get_tasks_for_repo(repo_name)
+            active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
 
-            for t in all_tasks:
-                tid = t.get("id")
-                if tid not in state["known_tasks"]:
-                    title = t.get("suggestedTitle") or t.get("title") or "Untitled Task"
-                    log(f"🆕 [NEW TASK DETECTED] Task {tid}: '{title}'")
-                    record_event(state, "NEW_TASK", tid, title)
-                    state["known_tasks"][tid] = {
+            for s in all_sessions:
+                sid = s.get("id") or s.get("name", "").split("/")[-1]
+                if sid not in state["known_tasks"]:
+                    title = (s.get("title") or "Untitled Task").split("\n")[0].strip()
+                    log(f"🆕 [NEW SESSION] {sid}: '{title}'")
+                    record_event(state, "NEW_TASK", sid, title)
+                    state["known_tasks"][sid] = {
                         "title": title,
-                        "status": t.get("taskStatus"),
-                        "swebotStatus": t.get("swebotTaskStatus"),
+                        "state": s.get("state"),
                         "first_seen": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
 
             active_ids = set()
-            for t in active_tasks:
-                tid = t.get("id")
-                active_ids.add(tid)
-                info = handle_task(tid, state)
-                prev_status = state["known_tasks"].get(tid, {}).get("status")
-                cur_status = info.get("taskStatus") or info.get("swebotStatus")
-                if prev_status != cur_status:
-                    log(
-                        f"🔄 [STATUS CHANGE] Task {tid} ('{info.get('title')}'): {prev_status} -> {cur_status}"
-                    )
-                    record_event(
-                        state, "STATUS_CHANGE", tid, f"{prev_status} -> {cur_status}"
-                    )
-                    state["known_tasks"].setdefault(tid, {})["status"] = cur_status
-                    state["known_tasks"][tid]["swebotStatus"] = info.get("swebotStatus")
+            for s in active_sessions:
+                sid = s.get("id") or s.get("name", "").split("/")[-1]
+                active_ids.add(sid)
+                info = handle_session(s, state)
+                prev_st = state["known_tasks"].get(sid, {}).get("state")
+                cur_st = info.get("state")
+                if prev_st != cur_st:
+                    log(f"🔄 [STATUS CHANGE] Session {sid} ('{info.get('title')}'): {prev_st} -> {cur_st}")
+                    record_event(state, "STATUS_CHANGE", sid, f"{prev_st} -> {cur_st}")
+                    state["known_tasks"].setdefault(sid, {})["state"] = cur_st
 
-            for tid, tinfo in list(state["known_tasks"].items()):
-                if tinfo.get("status") not in [
-                    "COMPLETED",
-                    "FAILED",
-                    "SWEBOT_TASK_STATUS_COMPLETED",
-                    "SWEBOT_TASK_STATUS_FAILED",
-                ]:
-                    if tid not in active_ids:
+            for sid, tinfo in list(state["known_tasks"].items()):
+                if tinfo.get("state") not in ["COMPLETED", "FAILED"]:
+                    if sid not in active_ids:
                         try:
-                            _, d = api_call(
-                                f"https://aida.googleapis.com/v1/swebot/tasks/{tid}"
-                            )
-                            curr_task = d.get("task", {})
-                            final_status = curr_task.get("taskStatus") or curr_task.get(
-                                "swebotTaskStatus"
-                            )
-                            log(
-                                f"🏁 [TASK COMPLETED/ENDED] Task {tid} ('{tinfo.get('title')}') finalized with status: {final_status}"
-                            )
-                            record_event(
-                                state,
-                                "TASK_FINISHED",
-                                tid,
-                                f"Final status: {final_status}",
-                            )
-                            tinfo["status"] = final_status
+                            _, d = jules_api_request(f"sessions/{sid}")
+                            final_st = d.get("state")
+                            log(f"🏁 [SESSION ENDED] {sid} ('{tinfo.get('title')}') finalized with state: {final_st}")
+                            record_event(state, "TASK_FINISHED", sid, f"Final status: {final_st}")
+                            tinfo["state"] = final_st
                         except Exception:
                             pass
 
@@ -400,8 +381,14 @@ def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Jules Watchdog Monitoring Daemon")
     parser.add_argument("--repo", default=DEFAULT_REPO, help="Repository source ID (e.g. github/owner/repo)")
-    parser.add_argument("--interval", type=int, default=20, help="Polling interval in seconds")
+    parser.add_argument("--interval", type=int, default=20, help="Polling interval in seconds (default: 20)")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
+    parser.add_argument("--api-key", default=os.environ.get("JULES_API_KEY", ""), help="Google Jules API key (or set JULES_API_KEY env var)")
     args = parser.parse_args()
 
-    run_watchdog_loop(poll_interval=args.interval, repo_name=args.repo, oneshot=args.status)
+    run_watchdog_loop(
+        poll_interval=args.interval,
+        repo_name=args.repo,
+        oneshot=args.status,
+        api_key=args.api_key,
+    )
