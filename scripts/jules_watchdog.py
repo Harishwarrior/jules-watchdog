@@ -240,7 +240,7 @@ def jules_api_request(endpoint, method="GET", payload=None):
         raise
 
 
-def get_all_sessions_for_repo(repo_name=DEFAULT_REPO):
+def get_all_sessions_for_repo(repo_name=DEFAULT_REPO, state=None):
     """Retrieve ALL sessions with full pagination."""
     repo_normalized = repo_name.replace("github/", "").replace("sources/", "")
     all_sessions = []
@@ -268,7 +268,19 @@ def get_all_sessions_for_repo(repo_name=DEFAULT_REPO):
         if not repo_normalized or repo_normalized in src or not src:
             repo_sessions.append(s)
 
-    active = [s for s in repo_sessions if s.get("state") not in ["COMPLETED", "FAILED"]]
+    active = []
+    revived_set = set(state.get("revived_sessions", [])) if state else set()
+    for s in repo_sessions:
+        st = s.get("state")
+        sid = s.get("id") or s.get("name", "").split("/")[-1]
+        if st not in ["COMPLETED", "FAILED"]:
+            active.append(s)
+        elif st == "COMPLETED":
+            outputs = s.get("outputs", [])
+            has_pr = any(o.get("pullRequest") for o in outputs)
+            if not has_pr and sid not in revived_set:
+                active.append(s)
+
     return active, repo_sessions
 
 
@@ -399,11 +411,26 @@ def handle_session(session, state):
             log(f"❌ Failed to send prompt for session {sid}: {err}")
             record_event(state, "FEEDBACK_ERROR", sid, str(err))
 
-    # 3. Auto-archive completed sessions with PRs
+    # 3. Handle COMPLETED sessions: archive if PR exists, revive if dormant without PR
     elif st == "COMPLETED":
         outputs = session.get("outputs", [])
-        if any(o.get("pullRequest") for o in outputs):
+        has_pr = any(o.get("pullRequest") for o in outputs)
+        if has_pr:
             archive_session(sid)
+        else:
+            revived_sessions = state.setdefault("revived_sessions", [])
+            if sid not in revived_sessions:
+                log(f"🔄 [AUTO-REVIVE] Reviving dormant session {sid} ('{title}') lacking PR...")
+                answer = get_unblock_instruction(repo_name=src_repo, title=title)
+                ok, err = send_session_message(sid, answer)
+                if ok:
+                    log(f"✅ Successfully revived session {sid}")
+                    revived_sessions.append(sid)
+                    record_event(state, "SESSION_REVIVED", sid, f"Revived dormant session: {title}")
+                    info["state"] = "REVIVED"
+                else:
+                    log(f"❌ Failed to revive session {sid}: {err}")
+                    record_event(state, "REVIVE_ERROR", sid, str(err))
 
     return info
 
@@ -413,8 +440,8 @@ def check_status(repo_name=DEFAULT_REPO, api_key=None):
     if api_key:
         JULES_API_KEY = api_key
 
-    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
     state = load_state()
+    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name, state=state)
 
     print(f"\n=======================================================")
     print(f" Jules Watchdog Status Report: {repo_name}")
@@ -453,12 +480,12 @@ def trigger_all_active(repo_name=DEFAULT_REPO, api_key=None):
         JULES_API_KEY = api_key
 
     log(f"🚀 Triggering all active agent tasks for {repo_name}...")
-    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
     state = load_state()
+    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name, state=state)
 
     actionable = [
         s for s in active_sessions
-        if s.get("state") in ["AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK"]
+        if s.get("state") in ["AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK", "COMPLETED"]
     ]
 
     log(f"Found {len(active_sessions)} active sessions ({len(actionable)} actionable).")
@@ -495,7 +522,7 @@ def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False, t
 
     while True:
         try:
-            active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
+            active_sessions, all_sessions = get_all_sessions_for_repo(repo_name, state=state)
 
             for s in all_sessions:
                 sid = s.get("id") or s.get("name", "").split("/")[-1]
