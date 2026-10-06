@@ -2,7 +2,7 @@
 """
 Jules Watchdog Monitor & Automation Daemon
 
-Monitors Google Jules coding sessions / tasks for rewardive-mobile (or specified repository),
+Monitors Google Jules coding sessions / tasks for any repository (auto-detected or specified),
 automatically handling plan approvals, feedback requests, pagination, and state reporting.
 Supports both Google Jules v1alpha API (API Key from root .env or JULES_API_KEY env var) and OAuth.
 """
@@ -18,13 +18,33 @@ import time
 import urllib.error
 import urllib.request
 
-DEFAULT_REPO = "github/rewardive/rewardive-mobile"
+DEFAULT_REPO = "github/rewardive/rewardive-server"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../.."))
 STATE_FILE = os.path.join(SCRIPT_DIR, "watchdog_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "watchdog.log")
 
 JULES_BASE_URL = "https://jules.googleapis.com/v1alpha"
+
+
+def detect_repo_source_id():
+    """Detect repo sourceId from git remote origin or fall back to DEFAULT_REPO."""
+    try:
+        url = (
+            subprocess.check_output(
+                ["git", "config", "--get", "remote.origin.url"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            .strip()
+        )
+        if "github.com" in url:
+            part = url.split("github.com", 1)[1].lstrip(":").lstrip("/")
+            if part.endswith(".git"):
+                part = part[:-4]
+            return f"github/{part}"
+    except Exception:
+        pass
+    return DEFAULT_REPO
 
 
 def load_env_api_key():
@@ -154,6 +174,7 @@ def get_token():
     # 2. Python keyring library
     try:
         import keyring
+
         token_data = json.loads(keyring.get_password("jules-cli", "default"))
         return token_data.get("access_token")
     except Exception:
@@ -162,6 +183,7 @@ def get_token():
     # 3. Linux SecretStorage
     try:
         import secretstorage
+
         bus = secretstorage.dbus_init()
         collection = secretstorage.get_default_collection(bus)
         for item in collection.get_all_items():
@@ -271,10 +293,40 @@ def send_session_message(session_id, prompt):
         return False, str(e)
 
 
+def get_unblock_instruction(repo_name="", title=""):
+    """Generate stack-aware unblocking response for Jules."""
+    repo_lower = repo_name.lower()
+    if os.path.exists("go.mod") or "rewardive-server" in repo_lower or "go" in repo_lower:
+        return (
+            "Please proceed with the proposed implementation following Go conventions and standard project patterns. "
+            "Verify with 'go test ./...' and 'go vet ./...', and create the pull request once verified."
+        )
+    elif os.path.exists("pubspec.yaml") or "rewardive-mobile" in repo_lower or "flutter" in repo_lower:
+        return (
+            "Please proceed with the proposed implementation following Flutter conventions. "
+            "Verify using 'flutter analyze' and 'flutter test', and create the pull request once verified."
+        )
+    elif os.path.exists("package.json"):
+        return (
+            "Please proceed with the proposed implementation following project conventions. "
+            "Verify using 'npm test', and create the pull request once verified."
+        )
+    elif os.path.exists("pyproject.toml") or os.path.exists("requirements.txt"):
+        return (
+            "Please proceed with the proposed implementation following Python conventions. "
+            "Verify using pytest, and create the pull request once verified."
+        )
+    return (
+        "Please proceed with the proposed implementation following project conventions. "
+        "Verify your changes with tests, and create the pull request once verified."
+    )
+
+
 def handle_session(session, state):
     sid = session.get("id") or session.get("name", "").split("/")[-1]
     st = session.get("state")
     title = (session.get("title") or "Untitled Task").split("\n")[0].strip()
+    src_repo = session.get("sourceContext", {}).get("source", "")
 
     info = {
         "id": sid,
@@ -289,22 +341,20 @@ def handle_session(session, state):
         if ok:
             log(f"✅ Successfully approved plan for session {sid}")
             record_event(state, "PLAN_APPROVED", sid, f"Plan approved for: {title}")
+            info["state"] = "IN_PROGRESS"
         else:
             log(f"❌ Failed to approve plan for session {sid}: {err}")
             record_event(state, "PLAN_APPROVE_ERROR", sid, str(err))
 
     # 2. Auto-unblock feedback
     elif st == "AWAITING_USER_FEEDBACK":
-        log(f"💬 [AUTO-FEEDBACK] Sending prompt for session {sid} ('{title}')...")
-        answer = (
-            "Please proceed with the proposed implementation. "
-            "Follow standard project conventions, verify using 'fvm flutter analyze' and 'fvm flutter test', "
-            "and create the pull request once verified."
-        )
+        log(f"💬 [AUTO-FEEDBACK] Sending unblocking prompt for session {sid} ('{title}')...")
+        answer = get_unblock_instruction(repo_name=src_repo, title=title)
         ok, err = send_session_message(sid, answer)
         if ok:
             log(f"✅ Successfully sent unblocking prompt for session {sid}")
             record_event(state, "FEEDBACK_GIVEN", sid, f"Feedback sent for: {title}")
+            info["state"] = "FEEDBACK_SENT"
         else:
             log(f"❌ Failed to send prompt for session {sid}: {err}")
             record_event(state, "FEEDBACK_ERROR", sid, str(err))
@@ -350,10 +400,45 @@ def check_status(repo_name=DEFAULT_REPO, api_key=None):
     print(f"=======================================================\n")
 
 
-def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False, api_key=None):
+def trigger_all_active(repo_name=DEFAULT_REPO, api_key=None):
+    """One-shot sweep: unblock all sessions currently awaiting user feedback or plan approval."""
     global JULES_API_KEY
     if api_key:
         JULES_API_KEY = api_key
+
+    log(f"🚀 Triggering all active agent tasks for {repo_name}...")
+    active_sessions, all_sessions = get_all_sessions_for_repo(repo_name)
+    state = load_state()
+
+    actionable = [
+        s for s in active_sessions
+        if s.get("state") in ["AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK"]
+    ]
+
+    log(f"Found {len(active_sessions)} active sessions ({len(actionable)} actionable).")
+
+    processed = 0
+    for s in actionable:
+        sid = s.get("id") or s.get("name", "").split("/")[-1]
+        title = (s.get("title") or "Untitled Task").split("\n")[0].strip()
+        st = s.get("state")
+        log(f"[{processed+1}/{len(actionable)}] Handling {sid} [{st}]: {title[:50]}...")
+        handle_session(s, state)
+        processed += 1
+        time.sleep(0.5)
+
+    save_state(state)
+    log(f"✨ Sweep complete! Successfully processed {processed} actionable sessions.")
+
+
+def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False, trigger_all=False, api_key=None):
+    global JULES_API_KEY
+    if api_key:
+        JULES_API_KEY = api_key
+
+    if trigger_all:
+        trigger_all_active(repo_name=repo_name, api_key=api_key)
+        return
 
     if oneshot:
         check_status(repo_name, api_key=api_key)
@@ -411,10 +496,12 @@ def run_watchdog_loop(poll_interval=20, repo_name=DEFAULT_REPO, oneshot=False, a
 
 
 if __name__ == "__main__":
+    auto_repo = detect_repo_source_id()
     parser = argparse.ArgumentParser(description="Jules Watchdog Monitoring Daemon")
-    parser.add_argument("--repo", default=DEFAULT_REPO, help="Repository source ID (e.g. github/owner/repo)")
+    parser.add_argument("--repo", default=auto_repo, help=f"Repository source ID (default detected: {auto_repo})")
     parser.add_argument("--interval", type=int, default=20, help="Polling interval in seconds (default: 20)")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
+    parser.add_argument("--trigger-all", action="store_true", help="Trigger/unblock all actionable sessions immediately")
     parser.add_argument("--api-key", default=None, help="Google Jules API key (or set JULES_API_KEY in .env)")
     args = parser.parse_args()
 
@@ -422,5 +509,6 @@ if __name__ == "__main__":
         poll_interval=args.interval,
         repo_name=args.repo,
         oneshot=args.status,
+        trigger_all=args.trigger_all,
         api_key=args.api_key,
     )

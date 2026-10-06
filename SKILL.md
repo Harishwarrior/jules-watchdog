@@ -9,11 +9,12 @@ Automated monitoring and watchdog daemon for Google Jules coding tasks and repos
 
 ## How It Works
 
-1. **Polls Active Sessions**: Discovers tasks across connected repositories using the official Google Jules v1alpha API (`https://jules.googleapis.com/v1alpha`).
+1. **Polls Active Sessions**: Discovers tasks across connected repositories using the official Google Jules v1alpha API (`https://jules.googleapis.com/v1alpha`) or AIDA SweBot API.
 2. **Autonomous Plan Approval**: Detects when Jules pauses for plan approval (`AWAITING_PLAN_APPROVAL`) and auto-approves the plan via `:approvePlan`.
-3. **Interactive Feedback Dispatch**: Detects questions prompted by Jules (`AWAITING_USER_FEEDBACK`) and sends answers via `:sendMessage` to unblock the agent.
-4. **Dual Authentication**: Supports Google Jules API Key authentication (via `JULES_API_KEY` environment variable or `--api-key` argument) as well as OAuth token credentials from `jules-cli`.
-5. **Lifecycle State Logging**: Tracks transitions to terminal states (`COMPLETED`, `FAILED`) and maintains detailed execution history.
+3. **Interactive Feedback Dispatch**: Detects questions prompted by Jules (`AWAITING_USER_FEEDBACK`) and sends tailored tech stack aware answers via `:sendMessage` to unblock the agent.
+4. **Auto-Detects Repository & Tech Stack**: Automatically detects the current git repository source ID (e.g. `github/rewardive/rewardive-server`) and selects the appropriate verification commands (`go test`, `flutter test`, `npm test`, `pytest`).
+5. **Dual Authentication**: Supports Google Jules API Key authentication (via `JULES_API_KEY` environment variable or `--api-key` argument) as well as OAuth token credentials from `jules-cli`.
+6. **Lifecycle State Logging**: Tracks transitions to terminal states (`COMPLETED`, `FAILED`) and maintains detailed execution history.
 
 ## Usage
 
@@ -23,45 +24,49 @@ python3 scripts/jules_watchdog.py [options]
 
 ### Arguments
 
-- `--api-key <key>` - Google Jules API key (defaults to `JULES_API_KEY` environment variable).
+- `--api-key <key>` - Google Jules API key (defaults to `JULES_API_KEY` environment variable or `.env`).
 - `--status` - Print current status report for all tasks and exit.
+- `--trigger-all` - One-shot sweep: unblock all sessions currently awaiting user feedback or plan approval immediately.
 - `--interval <seconds>` - Set polling interval for continuous background monitoring (default: `20`).
-- `--repo <sourceId>` - Target repository source ID (default: `github/rewardive/rewardive-mobile`).
+- `--repo <sourceId>` - Target repository source ID (auto-detected from `git remote origin` if omitted).
 
 ### Examples
 
-**1. One-shot status check (using API Key):**
+**1. One-shot sweep to trigger & unblock all waiting agent tasks:**
 ```bash
-export JULES_API_KEY="your-jules-api-key"
-python3 scripts/jules_watchdog.py --status
-```
-or via argument:
-```bash
-python3 scripts/jules_watchdog.py --api-key "your-jules-api-key" --status
+python3 scripts/jules_watchdog.py --trigger-all
 ```
 
-**2. Continuous background monitoring daemon:**
+**2. One-shot status check:**
+```bash
+python3 scripts/jules_watchdog.py --status
+```
+
+**3. Continuous background monitoring daemon:**
 ```bash
 python3 scripts/jules_watchdog.py --interval 20
 ```
 
-**3. Target a specific GitHub repository:**
+**4. Explicit API Key and repository target:**
 ```bash
-python3 scripts/jules_watchdog.py --repo github/owner/repo --interval 15
+python3 scripts/jules_watchdog.py --api-key "AQ..." --repo github/rewardive/rewardive-server --trigger-all
 ```
 
 ## Output
 
 ```text
 =======================================================
- Jules Watchdog Status Report: github/owner/repo
+ Jules Watchdog Status Report: github/rewardive/rewardive-server
 =======================================================
-Total Sessions Tracked: 51
-Currently Active:       0
-Completed:              43
-Failed / Stale:         8
+Total Sessions Tracked: 74
+Currently Active:       28
+Completed:              44
+Failed / Stale:         2
 
-No sessions currently active or awaiting approval.
+Active Sessions (28):
+  • [IN_PROGRESS] 15709104453732183237: Add Unit Tests for rate_limiter.go
+  • [IN_PROGRESS] 12364009196675988158: Testing Improvement Task
+...
 =======================================================
 ```
 
@@ -91,7 +96,7 @@ git clone https://github.com/Harishwarrior/jules-watchdog.git .cursor/skills/jul
 ## Authentication Setup
 
 1. **Jules API Key (Recommended):**
-   - Provide your Google Jules API key via the `JULES_API_KEY` environment variable or the `--api-key` CLI argument.
+   - Provide your Google Jules API key via the `JULES_API_KEY` environment variable, `.env` file, or `--api-key` CLI argument:
    ```bash
    export JULES_API_KEY="your-api-key"
    ```
@@ -103,9 +108,4 @@ git clone https://github.com/Harishwarrior/jules-watchdog.git .cursor/skills/jul
 When tasks reach terminal completion, present summary metrics to the user:
 - Task ID and session URL (`https://jules.google.com/session/<taskId>`)
 - Final outcome (`COMPLETED` or `FAILED`)
-- Generated Git branch and commit details if changes were made.
-
-## Troubleshooting
-
-- **`No Jules credentials found` / `401 Unauthorized`**: Set the `JULES_API_KEY` environment variable, pass `--api-key`, or authenticate via `jules login`.
-- **`jules binary not found`**: Ensure `jules` is installed via Homebrew (`/home/linuxbrew/.linuxbrew/bin/jules` or in system `$PATH`) if using OAuth fallback.
+- Generated Git branch and PR / commit details.
