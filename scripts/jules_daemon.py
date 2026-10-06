@@ -14,7 +14,34 @@ import time
 import urllib.error
 import urllib.request
 
-API_KEY = os.environ.get("JULES_API_KEY", "")
+def load_env_api_key():
+    """Load JULES_API_KEY from os.environ or root .env files."""
+    if os.environ.get("JULES_API_KEY"):
+        return os.environ.get("JULES_API_KEY").strip()
+
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(5):
+        env_file = os.path.join(cur, ".env")
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("JULES_API_KEY="):
+                            val = line.split("=", 1)[1].strip().strip("\"'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    return None
+
+
+API_KEY = load_env_api_key() or ""
 BASE_URL = "https://jules.googleapis.com/v1alpha"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jules_daemon.log")
 
@@ -31,6 +58,9 @@ def log(msg):
 
 
 def api_get(endpoint):
+    global API_KEY
+    if not API_KEY:
+        API_KEY = load_env_api_key() or ""
     sep = "&" if "?" in endpoint else "?"
     url = f"{BASE_URL}/{endpoint}"
     headers = {}
@@ -43,6 +73,9 @@ def api_get(endpoint):
 
 
 def api_post(endpoint, payload=None):
+    global API_KEY
+    if not API_KEY:
+        API_KEY = load_env_api_key() or ""
     sep = "&" if "?" in endpoint else "?"
     url = f"{BASE_URL}/{endpoint}"
     headers = {"Content-Type": "application/json"}
@@ -132,7 +165,7 @@ def main(interval=20):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Jules Autonomous Watchdog Daemon")
-    parser.add_argument("--api-key", default=os.environ.get("JULES_API_KEY", ""), help="Google Jules API key (or set JULES_API_KEY env var)")
+    parser.add_argument("--api-key", default=None, help="Google Jules API key (or set JULES_API_KEY in .env)")
     parser.add_argument("--interval", type=int, default=20, help="Cycle interval in seconds (default: 20)")
     args = parser.parse_args()
 

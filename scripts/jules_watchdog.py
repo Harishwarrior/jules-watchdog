@@ -4,7 +4,7 @@ Jules Watchdog Monitor & Automation Daemon
 
 Monitors Google Jules coding sessions / tasks for rewardive-mobile (or specified repository),
 automatically handling plan approvals, feedback requests, pagination, and state reporting.
-Supports Google Jules v1alpha API (API Key via JULES_API_KEY or --api-key argument, and OAuth).
+Supports both Google Jules v1alpha API (API Key from root .env or JULES_API_KEY env var) and OAuth.
 """
 
 import argparse
@@ -24,8 +24,37 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../.."))
 STATE_FILE = os.path.join(SCRIPT_DIR, "watchdog_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "watchdog.log")
 
-JULES_API_KEY = os.environ.get("JULES_API_KEY", "")
 JULES_BASE_URL = "https://jules.googleapis.com/v1alpha"
+
+
+def load_env_api_key():
+    """Load JULES_API_KEY from os.environ or root .env files."""
+    if os.environ.get("JULES_API_KEY"):
+        return os.environ.get("JULES_API_KEY").strip()
+
+    cur = os.path.abspath(os.getcwd())
+    for _ in range(5):
+        env_file = os.path.join(cur, ".env")
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("JULES_API_KEY="):
+                            val = line.split("=", 1)[1].strip().strip("\"'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    return None
+
+
+JULES_API_KEY = load_env_api_key() or ""
 
 
 def log(msg, to_file=True):
@@ -148,6 +177,9 @@ def get_token():
 def jules_api_request(endpoint, method="GET", payload=None):
     """Call Google Jules v1alpha API using API Key or OAuth Bearer token."""
     global JULES_API_KEY
+    if not JULES_API_KEY:
+        JULES_API_KEY = load_env_api_key() or ""
+
     url = f"{JULES_BASE_URL}/{endpoint}"
     headers = {
         "Content-Type": "application/json",
@@ -163,7 +195,7 @@ def jules_api_request(endpoint, method="GET", payload=None):
             headers["Authorization"] = f"Bearer {token}"
         else:
             raise ValueError(
-                "No Jules credentials found. Set JULES_API_KEY environment variable, "
+                "No Jules credentials found. Set JULES_API_KEY in root .env or environment variable, "
                 "pass --api-key, or authenticate with 'jules login'."
             )
 
@@ -383,7 +415,7 @@ if __name__ == "__main__":
     parser.add_argument("--repo", default=DEFAULT_REPO, help="Repository source ID (e.g. github/owner/repo)")
     parser.add_argument("--interval", type=int, default=20, help="Polling interval in seconds (default: 20)")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
-    parser.add_argument("--api-key", default=os.environ.get("JULES_API_KEY", ""), help="Google Jules API key (or set JULES_API_KEY env var)")
+    parser.add_argument("--api-key", default=None, help="Google Jules API key (or set JULES_API_KEY in .env)")
     args = parser.parse_args()
 
     run_watchdog_loop(
