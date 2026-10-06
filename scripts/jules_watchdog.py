@@ -322,6 +322,46 @@ def get_unblock_instruction(repo_name="", title=""):
     )
 
 
+def archive_session(session_id):
+    """Archive a session via Google Jules v1alpha API."""
+    try:
+        jules_api_request(f"sessions/{session_id}:archive", method="POST", payload={})
+        return True, None
+    except Exception as e:
+        return False, e
+
+
+def archive_completed_sessions(repo_name=DEFAULT_REPO, api_key=None):
+    """Find and archive all completed tasks that have created pull requests."""
+    global JULES_API_KEY
+    if api_key:
+        JULES_API_KEY = api_key
+
+    log(f"📦 Checking sessions to archive for {repo_name}...")
+    _, all_sessions = get_all_sessions_for_repo(repo_name)
+    to_archive = []
+    for s in all_sessions:
+        sid = s.get("id") or s.get("name", "").split("/")[-1]
+        outputs = s.get("outputs", [])
+        if any(o.get("pullRequest") for o in outputs):
+            title = (s.get("title") or "Untitled Task").split("\n")[0].strip()
+            to_archive.append((sid, title))
+
+    log(f"Found {len(to_archive)} completed sessions with PRs to archive.")
+    count = 0
+    for sid, title in to_archive:
+        ok, err = archive_session(sid)
+        if ok:
+            count += 1
+            if count % 10 == 0:
+                log(f"Archived {count}/{len(to_archive)} sessions...")
+        else:
+            log(f"Failed archiving {sid}: {err}")
+
+    log(f"🎉 Successfully archived {count}/{len(to_archive)} sessions.")
+    return count
+
+
 def handle_session(session, state):
     sid = session.get("id") or session.get("name", "").split("/")[-1]
     st = session.get("state")
@@ -358,6 +398,12 @@ def handle_session(session, state):
         else:
             log(f"❌ Failed to send prompt for session {sid}: {err}")
             record_event(state, "FEEDBACK_ERROR", sid, str(err))
+
+    # 3. Auto-archive completed sessions with PRs
+    elif st == "COMPLETED":
+        outputs = session.get("outputs", [])
+        if any(o.get("pullRequest") for o in outputs):
+            archive_session(sid)
 
     return info
 
@@ -502,8 +548,13 @@ if __name__ == "__main__":
     parser.add_argument("--interval", type=int, default=20, help="Polling interval in seconds (default: 20)")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
     parser.add_argument("--trigger-all", action="store_true", help="Trigger/unblock all actionable sessions immediately")
+    parser.add_argument("--archive-completed", action="store_true", help="Archive all completed sessions that have created PRs")
     parser.add_argument("--api-key", default=None, help="Google Jules API key (or set JULES_API_KEY in .env)")
     args = parser.parse_args()
+
+    if args.archive_completed:
+        archive_completed_sessions(repo_name=args.repo, api_key=args.api_key)
+        sys.exit(0)
 
     run_watchdog_loop(
         poll_interval=args.interval,

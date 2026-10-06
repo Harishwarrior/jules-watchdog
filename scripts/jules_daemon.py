@@ -244,6 +244,17 @@ def process_cycle():
     for s in incomplete_completed:
         check_and_handle_session_activity(s)
 
+    # 5. Auto-archive completed sessions that have created PRs
+    for s in completed_with_pr:
+        sid = s.get("id") or s.get("name").split("/")[-1]
+        title = (s.get("title") or "Untitled").split("\n")[0][:60]
+        try:
+            api_post(f"sessions/{sid}:archive")
+            log(f"📦 [AUTO-ARCHIVED] Session {sid} ({title})")
+        except Exception as e:
+            # Already archived or archive failed
+            pass
+
     log(
         f"📊 Status: Active={len(in_progress)} | Approvals={len(pending_plans)} | Feedback={len(stuck_feedback)} | Completed(PR)={len(completed_with_pr)} | NeedsPR={len(incomplete_completed)}"
     )
